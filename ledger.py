@@ -1,15 +1,13 @@
-"""Single-currency, integer-cent transfer lab. All examples are synthetic."""
+"""A small SQLite ledger to practice with. Amounts are in cents."""
 import sqlite3
 from pathlib import Path
 
 class Ledger:
     def __init__(self, path=':memory:'):
         self.db = sqlite3.connect(path)
-        # SQLite foreign-key checks must be enabled separately for each connection.
         self.db.execute('PRAGMA foreign_keys = ON')
         self.db.executescript(Path(__file__).with_name('sql').joinpath('schema.sql').read_text())
 
-    # Opening balances seed fictional accounts and remain the reconciliation baseline.
     def account(self, account_id, opening_cents):
         if type(opening_cents) is not int or opening_cents < 0:
             raise ValueError('Opening balance must be nonnegative integer cents')
@@ -23,43 +21,34 @@ class Ledger:
         return row[0]
 
     def transfer(self, source, destination, amount_cents, key, *, fail_after_debit=False):
-        # bool is an int subclass in Python: exact type checking rejects True as one cent.
+        # Reject booleans too: Python treats True as an integer.
         if type(amount_cents) is not int or amount_cents <= 0:
             raise ValueError('Amount must be positive integer cents')
         if not isinstance(key, str) or not key.strip():
             raise ValueError('An idempotency key is required')
         if source == destination:
             raise ValueError('Source and destination must differ')
-        # BEGIN IMMEDIATE serializes writers for this SQLite lab. Database constraints
-        # and the transaction protect balances and postings, including on failure.
+        # Both balances and the postings need to save together.
         with self.db:
             self.db.execute('BEGIN IMMEDIATE')
             prior = self.db.execute('SELECT id, source_id, destination_id, amount_cents FROM transfers WHERE request_key=?', (key,)).fetchone()
-            # A retry reuses the original outcome only when the entire transfer matches.
             if prior:
                 if prior[1:] != (source, destination, amount_cents):
                     raise ValueError('Idempotency key was used for a different request')
                 return prior[0]
             self.balance(source)
             self.balance(destination)
-            # Check available funds inside the same SQL update that subtracts the money.
             debit = self.db.execute('UPDATE accounts SET balance_cents=balance_cents-? WHERE id=? AND balance_cents>=?', (amount_cents, source, amount_cents))
             if debit.rowcount != 1:
                 raise ValueError('Insufficient funds')
-            # The test-only hook proves an exception rolls back the debit and all later work.
+            # Leave this switch for trying a failure halfway through a transfer.
             if fail_after_debit:
                 raise RuntimeError('Injected failure after debit')
             self.db.execute('UPDATE accounts SET balance_cents=balance_cents+? WHERE id=?', (amount_cents, destination))
             cursor = self.db.execute('INSERT INTO transfers(request_key,source_id,destination_id,amount_cents) VALUES (?,?,?,?)', (key,source,destination,amount_cents))
             transfer_id = cursor.lastrowid
-            # Signed postings capture both sides; reconciliation checks these against balances.
             self.db.executemany('INSERT INTO postings(transfer_id,account_id,delta_cents) VALUES (?,?,?)', [(transfer_id,source,-amount_cents),(transfer_id,destination,amount_cents)])
             return transfer_id
-
-    def check(self, name):
-        """Return reconciliation exceptions; a healthy ledger returns no rows."""
-        query = Path(__file__).with_name('sql').joinpath(name + '.sql').read_text()
-        return self.db.execute(query).fetchall()
 
     def close(self):
         self.db.close()
