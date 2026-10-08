@@ -6,16 +6,19 @@ from pathlib import Path
 from ledger import Ledger
 
 class LedgerTests(unittest.TestCase):
+    # A fresh in-memory database prevents scenarios from inheriting another test's balance.
     def setUp(self):
         self.ledger = Ledger()
         self.addCleanup(self.ledger.close)
         self.ledger.account('checking', 10000)
         self.ledger.account('savings', 5000)
 
+    # Compare every persisted table to prove rejected requests have no partial side effects.
     def snapshot(self):
         return {table: self.ledger.db.execute('SELECT * FROM '+table+' ORDER BY id').fetchall()
                 for table in ['accounts','transfers','postings']}
 
+    # Empty exception queries plus intact foreign keys are the ledger's healthy invariants.
     def assert_clean(self):
         self.assertEqual(self.ledger.check('balance_reconciliation'), [])
         self.assertEqual(self.ledger.check('transfer_reconciliation'), [])
@@ -41,6 +44,7 @@ class LedgerTests(unittest.TestCase):
             self.ledger.transfer('checking','savings',10001,'too-much')
         self.assertEqual(self.snapshot(),before)
 
+    # Fail between debit and credit, then retry the same key after rollback.
     def test_injected_failure_rolls_back_and_retry_succeeds(self):
         before=self.snapshot()
         with self.assertRaises(RuntimeError):
@@ -86,6 +90,7 @@ class LedgerTests(unittest.TestCase):
                 self.ledger.transfer('checking','savings',100,key)
         self.assertEqual(self.snapshot(),before)
 
+    # Deliberate corruption proves the checks can detect errors instead of always returning empty.
     def test_reconciliation_detects_corrupted_balance(self):
         self.ledger.db.execute("UPDATE accounts SET balance_cents=9999 WHERE id='checking'")
         self.assertEqual(self.ledger.check('balance_reconciliation'), [('checking',9999,10000)])
@@ -96,6 +101,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.check('transfer_reconciliation'), [(transfer,)])
         self.assertTrue(self.ledger.check('balance_reconciliation'))
 
+    # A zero total alone cannot reveal a credit assigned to the wrong account.
     def test_reconciliation_detects_wrong_account_even_if_total_is_zero(self):
         transfer=self.ledger.transfer('checking','savings',100,'wrong-account')
         self.ledger.db.execute("UPDATE postings SET account_id='checking' WHERE transfer_id=? AND delta_cents>0",(transfer,))
@@ -103,6 +109,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger.check('transfer_reconciliation'), [(transfer,)])
 
     def test_deterministic_random_sequence_preserves_invariants(self):
+        # A fixed seed gives broad transfer sequences while keeping failures reproducible.
         rng=random.Random(2026)
         for i in range(200):
             source,destination=rng.choice([('checking','savings'),('savings','checking')])
@@ -112,6 +119,7 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(self.ledger.balance('checking')+self.ledger.balance('savings'),15000)
             self.assert_clean()
 
+    # Use an actual file here; an in-memory database cannot prove restart behavior.
     def test_persistence_and_idempotency_survive_reopen(self):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'lab.db'
